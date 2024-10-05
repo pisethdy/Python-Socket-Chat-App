@@ -1,5 +1,17 @@
 import threading
 import socket
+import smtplib
+import logging
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+
+# Setup logging with a cleaner format
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",  
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 PORT = 5050
 SERVER = "localhost"
@@ -7,103 +19,159 @@ ADDR = (SERVER, PORT)
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
+smtp_server = "smtp.gmail.com"
+smtp_port = 587
+smtp_email = "your_email@gmail.com"  # Change to your email
+smtp_password = "your_password"  # Change to your email password
+
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(ADDR)
 
 clients = {}
+clients_info = {}  # Store additional info like name and email
 clients_lock = threading.Lock()
 
-def broadcast(message, sender_conn=None):
-    """Send a message to all connected clients except the sender."""
-    with clients_lock:
-        for client_conn in list(clients.keys()):  # Iterate over a list to avoid modifying the dict while iterating
-            if client_conn != sender_conn:  # Avoid sending the message back to the sender
-                try:
-                    client_conn.sendall(message.encode(FORMAT))
-                except (BrokenPipeError, ConnectionResetError) as send_error:  # Specific exceptions
-                    print(f"[ERROR] Failed to send message to client: {send_error}")
-                    clients.pop(client_conn, None)  # Remove client if connection fails
+def send_email_notification(sender_name, sender_email, recipient_name, recipient_email, message):
+    """
+    Send an email notification to the recipient when they receive a message.
+    """
+    subject = f"New Message from {sender_name}"
+    body = f"""
+    Hello {recipient_name},
 
-def handle_client(conn, addr):
-    """Handles an individual client connection."""
-    client_name = None  # Initialize client_name
+    You have received a new message from {sender_name} ({sender_email}):
+
+    "{message}"
+
+    Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+    Regards,
+    Chat Server
+    """
+
+    msg = MIMEMultipart()
+    msg['From'] = smtp_email
+    msg['To'] = recipient_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
 
     try:
-        conn.send("Please enter your name!".encode(FORMAT))
-        client_name = conn.recv(1024).decode(FORMAT).strip()
+        smtp_server_conn = smtplib.SMTP(smtp_server, smtp_port)
+        smtp_server_conn.starttls()
+        smtp_server_conn.login(smtp_email, smtp_password)
+        smtp_server_conn.sendmail(smtp_email, recipient_email, msg.as_string())
+        smtp_server_conn.quit()
+        logging.info(f"Email notification sent to {recipient_email}.")
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
 
-        with clients_lock:
-            clients[conn] = client_name  # Store the client's name
 
-        print(f"[NEW CONNECTION] {client_name} ({addr}) connected")
+def broadcast(message, sender_conn=None):
+    """
+    Send a message to all connected clients except the sender (if applicable).
+    """
+    with clients_lock:
+        for client_conn, client_id in clients.items():
+            if client_conn != sender_conn:  # Don't send to the sender
+                try:
+                    client_conn.sendall(message)
+                except Exception as e:
+                    logging.error(f"Failed to send message to {client_id}: {e}")
+                    clients.pop(client_conn)
 
-        # Use a flag to control connection status
-        is_connected = True
-        while is_connected:
+
+def handle_client(conn, addr):
+    conn.send("Enter your name: ".encode(FORMAT))
+    name = conn.recv(1024).decode(FORMAT).strip()
+
+    conn.send("Enter your email: ".encode(FORMAT))
+    email = conn.recv(1024).decode(FORMAT).strip()
+
+    with clients_lock:
+        clients[conn] = name  # Use the client's name as the client ID
+        clients_info[conn] = {"name": name, "email": email}
+
+    logging.info(f"New connection: {name} ({addr}) with email {email}")
+
+    conn.send(f"Welcome, {name}! Your client ID is your name.".encode(FORMAT))
+
+    try:
+        connected = True
+        while connected:
             try:
                 msg = conn.recv(1024).decode(FORMAT)
                 if not msg:
                     break
 
                 if msg == DISCONNECT_MESSAGE:
-                    is_connected = False
-                    break
+                    connected = False
 
-                print(f"[{client_name}] {msg}")
+                logging.info(f"Message from {name}: {msg}")
 
-                if msg.startswith("all "):
-                    message = msg[len("all "):].strip()
-                    broadcast(f"[{client_name}] {message}", sender_conn=conn)
-                elif msg.startswith("@"):  # Check for direct message
-                    parts = msg.split(" ", 1)  # Split into two parts
-                    if len(parts) < 2:
-                        conn.sendall(f"[SERVER] Please specify a target client and a message.".encode(FORMAT))
-                        continue
+                if msg.startswith("@"):
+                    if ":" in msg:
+                        target_client, message = msg[1:].split(":", 1)
 
-                    target_client = parts[0][1:]  # Remove the '@' from target client name
-                    message = parts[1]
+                        if target_client.strip().lower() == "all":
+                            logging.info(f"Broadcasting message from {name}: {message}")
+                            broadcast(f"[{name}] {message}".encode(FORMAT), sender_conn=conn)
+                        else:
+                            found = False
+                            with clients_lock:
+                                for client_conn, client_data in clients_info.items():
+                                    if client_data['name'].lower() == target_client.strip().lower():
+                                        recipient_name = client_data['name']
+                                        recipient_email = client_data['email']
+                                        sender_name = clients_info[conn]['name']
+                                        sender_email = clients_info[conn]['email']
 
-                    found = False
-                    with clients_lock:
-                        for client_conn, client_id in clients.items():
-                            if target_client == client_id:
-                                client_conn.sendall(f"[{client_name} -> {client_id}] {message}".encode(FORMAT))
-                                found = True
-                                break
+                                        logging.info(f"Sending to {recipient_name} ({recipient_email}): {message}")
+                                        client_conn.sendall(
+                                            f"[{sender_name} -> {recipient_name}] {message}".encode(FORMAT))
 
-                    if not found:
-                        conn.sendall(f"[SERVER] Client {target_client} not found.".encode(FORMAT))
+                                        send_email_notification(sender_name, sender_email, recipient_name,
+                                                                recipient_email, message)
+                                        conn.sendall(f"[SERVER] Email sent to {recipient_name}.".encode(FORMAT))
+                                        found = True
+                                        break
+                            if not found:
+                                conn.sendall(f"[SERVER] Client {target_client} not found.".encode(FORMAT))
+                    else:
+                        conn.sendall(
+                            f"[SERVER] Invalid format. Use '@name: message' or '@all: message'.".encode(FORMAT))
                 else:
                     conn.sendall(
-                        f"[SERVER] Invalid message format. Use 'all <message>' or '@client <message>'.".encode(FORMAT))
+                        f"[SERVER] Invalid message format. Use '@name: message' or '@all: message'.".encode(
+                            FORMAT))
 
-            except (ConnectionResetError, BrokenPipeError) as recv_error:  # Different name for error variable
-                print(f"[ERROR] Connection with {client_name} ({addr}) was reset: {recv_error}")
+            except ConnectionResetError:
+                logging.error(f"Connection with {name} ({addr}) was reset.")
                 break
 
-    except (ConnectionResetError, BrokenPipeError) as handle_error:  # Different name for error variable
-        print(f"[ERROR] Exception in handling client {addr}: {handle_error}")
-
+    except Exception as e:
+        logging.error(f"Exception in handling client {addr}: {e}")
     finally:
         with clients_lock:
-            if client_name is not None:  # Check if client_name was successfully assigned
-                clients.pop(conn, None)
-                print(f"[DISCONNECT] {client_name} ({addr}) Disconnected")
-            else:
-                print(f"[DISCONNECT] A client disconnected without a name ({addr})")
+            clients.pop(conn, None)
+            clients_info.pop(conn, None)
         conn.close()
+        logging.info(f"{addr} ({name}) Disconnected")
+
 
 def server_console():
-    """Allows the server to send broadcast messages to all connected clients."""
+    """
+    Allows server to send messages to all clients.
+    Type your message in the server terminal to broadcast it to all clients.
+    """
     while True:
-        msg = input("[Server Message]: ")
-        if msg.lower() == 'q':
+        msg = input()
+        if msg == 'q':
             break
-        broadcast(f"[SERVER] {msg}")
+        broadcast(f"[SERVER] {msg}".encode(FORMAT))
+
 
 def start():
-    """Start the server and listen for incoming connections."""
-    print('[SERVER STARTED] Listening for connections...')
+    logging.info("Server started. Listening for connections...")
     server.listen()
 
     console_thread = threading.Thread(target=server_console, daemon=True)
@@ -114,14 +182,14 @@ def start():
             conn, addr = server.accept()
             thread = threading.Thread(target=handle_client, args=(conn, addr))
             thread.start()
+        except Exception as e:
+            logging.error(f"Exception in accepting connections: {e}")
 
-        except Exception as accept_error:  # Different name for error variable
-            print(f"[ERROR] Exception in accepting connections: {accept_error}")
 
 if __name__ == "__main__":
     try:
         start()
-    except Exception as start_error:  # Different name for error variable
-        print(f"[ERROR] Server encountered an error: {start_error}")
+    except Exception as e:
+        logging.error(f"Server encountered an error: {e}")
     finally:
         server.close()
